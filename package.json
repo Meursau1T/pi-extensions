@@ -1,0 +1,37 @@
+{
+  "name": "meursau1t-pi-extensions",
+  "version": "0.1.0",
+  "description": "Capability manager for Pi Skills and MCP servers",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Meursau1T/pi-extensions.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "skills",
+    "mcp"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-mcp-adapter/index.ts",
+      "./capability-manager/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.2.2",
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "open": "^10.2.0",
+    "recheck": "^4.5.0",
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
