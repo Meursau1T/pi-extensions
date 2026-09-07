@@ -1,15 +1,26 @@
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type {
+  AggregateCapabilityState,
   CapabilityChange,
   CapabilityPanelResult,
   CapabilityScope,
   CapabilityState,
   SkillCapability,
+  SkillFolderCapability,
 } from "./types.ts";
 
 interface PanelTui {
   requestRender(): void;
+}
+
+type PanelEntry =
+  | { kind: "folder"; folder: SkillFolderCapability }
+  | { kind: "skill"; row: SkillCapability; nested: boolean };
+
+interface EntryBlock {
+  name: string;
+  entries: PanelEntry[];
 }
 
 class SkillManagerPanel {
@@ -17,10 +28,11 @@ class SkillManagerPanel {
   private query = "";
   private selectedIndex = 0;
   private staged = new Map<string, CapabilityChange>();
-  private readonly maxVisible = 9;
+  private readonly maxVisible = 10;
 
   constructor(
     private rows: SkillCapability[],
+    private folders: SkillFolderCapability[],
     private projectAvailable: boolean,
     private tui: PanelTui,
     private theme: Theme,
@@ -28,8 +40,29 @@ class SkillManagerPanel {
     private done: (result: CapabilityPanelResult) => void,
   ) {}
 
-  private stageKey(row: SkillCapability, scope = this.scope): string {
-    return `${scope}\0${row.key}`;
+  private stageKey(kind: CapabilityChange["kind"], key: string, scope = this.scope): string {
+    return `${scope}\0${kind}\0${key}`;
+  }
+
+  private skillStage(row: SkillCapability, scope = this.scope): CapabilityChange | undefined {
+    const change = this.staged.get(this.stageKey("skill", row.key, scope));
+    return change?.kind === "skill" ? change : undefined;
+  }
+
+  private folderStage(folder: SkillFolderCapability, scope = this.scope): CapabilityChange | undefined {
+    const change = this.staged.get(this.stageKey("folder", folder.key, scope));
+    return change?.kind === "folder" ? change : undefined;
+  }
+
+  private folderFor(row: SkillCapability): SkillFolderCapability | undefined {
+    return row.folderKey ? this.folders.find((folder) => folder.key === row.folderKey) : undefined;
+  }
+
+  private folderChildren(folder: SkillFolderCapability, scope = this.scope): SkillCapability[] {
+    const keys = new Set(folder.childKeys);
+    return this.rows
+      .filter((row) => keys.has(row.key) && row.visibleIn.includes(scope))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   private baselineState(row: SkillCapability, scope = this.scope): CapabilityState {
@@ -37,32 +70,141 @@ class SkillManagerPanel {
   }
 
   private stateFor(row: SkillCapability, scope = this.scope): CapabilityState {
-    return this.staged.get(this.stageKey(row, scope))?.state ?? this.baselineState(row, scope);
+    const own = this.skillStage(row, scope);
+    if (own?.kind === "skill") return own.state;
+    const folder = this.folderFor(row);
+    const folderChange = folder && this.folderStage(folder, scope);
+    if (folderChange?.kind === "folder") return folderChange.state;
+    return this.baselineState(row, scope);
   }
 
   private inheritedFor(row: SkillCapability): boolean {
-    const stagedGlobal = this.staged.get(this.stageKey(row, "global"));
-    return stagedGlobal ? stagedGlobal.state === "enabled" : row.inheritedEnabled;
+    const own = this.skillStage(row, "global");
+    if (own?.kind === "skill") {
+      if (own.state === "inherit") return this.baseEffectiveFor(row, "global");
+      return own.state === "enabled";
+    }
+    const folder = this.folderFor(row);
+    const folderChange = folder && this.folderStage(folder, "global");
+    if (folderChange?.kind === "folder") return folderChange.state === "enabled";
+    return row.inheritedEnabled;
+  }
+
+  private baseEffectiveFor(row: SkillCapability, scope = this.scope): boolean {
+    const folder = this.folderFor(row);
+    if (!folder) {
+      return scope === "project" ? this.inheritedFor(row) : row.globalState === "enabled";
+    }
+
+    const folderChange = this.folderStage(folder, scope);
+    if (folderChange?.kind === "folder") {
+      if (scope === "project" && folderChange.state === "inherit") return this.inheritedFor(row);
+      return folderChange.state === "enabled";
+    }
+
+    if (scope === "project") {
+      if (folder.projectState === "enabled") return true;
+      if (folder.projectState === "disabled") return false;
+      return this.inheritedFor(row);
+    }
+
+    if (folder.globalState === "enabled") return true;
+    if (folder.globalState === "disabled") return false;
+    return row.globalState === "enabled";
   }
 
   private effectiveFor(row: SkillCapability, scope = this.scope): boolean {
-    const state = this.stateFor(row, scope);
-    if (scope === "project" && state === "inherit") return this.inheritedFor(row);
-    return state === "enabled";
+    const own = this.skillStage(row, scope);
+    if (own?.kind === "skill") {
+      return own.state === "inherit" ? this.baseEffectiveFor(row, scope) : own.state === "enabled";
+    }
+    const folder = this.folderFor(row);
+    const folderChange = folder && this.folderStage(folder, scope);
+    if (folderChange?.kind === "folder") {
+      if (scope === "project" && folderChange.state === "inherit") return this.inheritedFor(row);
+      return folderChange.state === "enabled";
+    }
+    if (scope === "project" && row.projectState === "inherit") {
+      const hasStagedGlobal = this.skillStage(row, "global") !== undefined
+        || (folder ? this.folderStage(folder, "global") !== undefined : false);
+      if (hasStagedGlobal || (folder && folder.projectState !== "inherit")) {
+        return this.baseEffectiveFor(row, scope);
+      }
+    }
+    return scope === "project" ? row.effectiveEnabled : row.globalState === "enabled";
   }
 
-  private visibleRows(): SkillCapability[] {
+  private aggregate(values: boolean[]): AggregateCapabilityState {
+    if (values.length === 0) return "mixed";
+    if (values.every(Boolean)) return "enabled";
+    if (values.every((value) => !value)) return "disabled";
+    return "mixed";
+  }
+
+  private folderEffectiveState(folder: SkillFolderCapability): AggregateCapabilityState {
+    return this.aggregate(this.folderChildren(folder).map((row) => this.effectiveFor(row)));
+  }
+
+  private folderIsInherited(folder: SkillFolderCapability): boolean {
+    if (this.scope !== "project") return false;
+    const folderChange = this.folderStage(folder);
+    if (folderChange?.kind === "folder") {
+      if (folderChange.state !== "inherit") return false;
+    } else if (folder.projectState !== "inherit") {
+      return false;
+    }
+    return this.folderChildren(folder).every((row) => this.stateFor(row) === "inherit");
+  }
+
+  private visibleEntries(): PanelEntry[] {
     const query = this.query.trim().toLowerCase();
-    return this.rows.filter((row) => {
-      if (!row.visibleIn.includes(this.scope)) return false;
-      if (!query) return true;
-      return `${row.name} ${row.description} ${row.sourceLabel}`.toLowerCase().includes(query);
-    });
+    const scopedRows = this.rows.filter((row) => row.visibleIn.includes(this.scope));
+    const rowByKey = new Map(scopedRows.map((row) => [row.key, row]));
+    const claimed = new Set<string>();
+    const blocks: EntryBlock[] = [];
+
+    for (const folder of this.folders) {
+      if (!folder.visibleIn.includes(this.scope)) continue;
+      const children = folder.childKeys
+        .map((key) => rowByKey.get(key))
+        .filter((row): row is SkillCapability => row !== undefined)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      if (children.length === 0) continue;
+      for (const child of children) claimed.add(child.key);
+
+      const folderMatches = !query
+        || `${folder.name} ${folder.pattern} ${folder.sourceLabel}`.toLowerCase().includes(query);
+      const matchingChildren = query && !folderMatches
+        ? children.filter((row) =>
+          `${row.name} ${row.description} ${row.sourceLabel}`.toLowerCase().includes(query),
+        )
+        : children;
+      if (matchingChildren.length === 0) continue;
+      blocks.push({
+        name: folder.name,
+        entries: [
+          { kind: "folder", folder },
+          ...matchingChildren.map((row) => ({ kind: "skill" as const, row, nested: true })),
+        ],
+      });
+    }
+
+    for (const row of scopedRows) {
+      if (claimed.has(row.key)) continue;
+      if (query && !`${row.name} ${row.description} ${row.sourceLabel}`.toLowerCase().includes(query)) {
+        continue;
+      }
+      blocks.push({ name: row.name, entries: [{ kind: "skill", row, nested: false }] });
+    }
+
+    return blocks
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .flatMap((block) => block.entries);
   }
 
   private clampSelection(): void {
-    const rows = this.visibleRows();
-    this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, rows.length - 1)));
+    const entries = this.visibleEntries();
+    this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, entries.length - 1)));
   }
 
   private switchScope(): void {
@@ -78,20 +220,73 @@ class SkillManagerPanel {
     return inheritedEnabled ? "inherit" : "disabled";
   }
 
-  private toggleSelected(): void {
-    const row = this.visibleRows()[this.selectedIndex];
-    if (!row || row.readOnly) return;
+  private toggleSkill(row: SkillCapability): void {
+    if (row.readOnly) return;
+    const folder = this.folderFor(row);
+    let next: CapabilityState;
 
-    const current = this.stateFor(row);
-    const next = this.scope === "project"
-      ? this.nextProjectState(row, current)
-      : current === "enabled" ? "disabled" : "enabled";
-    const key = this.stageKey(row);
-    if (next === this.baselineState(row)) {
+    if (folder) {
+      const targetEnabled = !this.effectiveFor(row);
+      next = targetEnabled === this.baseEffectiveFor(row)
+        ? "inherit"
+        : targetEnabled ? "enabled" : "disabled";
+    } else {
+      const current = this.stateFor(row);
+      next = this.scope === "project"
+        ? this.nextProjectState(row, current)
+        : current === "enabled" ? "disabled" : "enabled";
+    }
+
+    const key = this.stageKey("skill", row.key);
+    const folderChange = folder && this.folderStage(folder);
+    const baseline = folderChange ? "inherit" : this.baselineState(row);
+    if (next === baseline) {
       this.staged.delete(key);
     } else {
-      this.staged.set(key, { row, scope: this.scope, state: next });
+      this.staged.set(key, { kind: "skill", row, scope: this.scope, state: next });
     }
+  }
+
+  private stageFolder(folder: SkillFolderCapability, state: CapabilityState): void {
+    for (const row of this.folderChildren(folder)) {
+      this.staged.delete(this.stageKey("skill", row.key));
+    }
+
+    const key = this.stageKey("folder", folder.key);
+    const baselineEffective = this.scope === "global" ? folder.globalState : folder.effectiveState;
+    if (state !== "inherit" && state === baselineEffective) {
+      this.staged.delete(key);
+      return;
+    }
+    if (
+      this.scope === "project"
+      && state === "inherit"
+      && folder.projectState === "inherit"
+      && this.folderChildren(folder).every((row) => row.projectState === "inherit")
+    ) {
+      this.staged.delete(key);
+      return;
+    }
+    this.staged.set(key, { kind: "folder", folder, scope: this.scope, state });
+  }
+
+  private toggleFolder(folder: SkillFolderCapability): void {
+    const state = this.folderEffectiveState(folder);
+    this.stageFolder(folder, state === "enabled" ? "disabled" : "enabled");
+  }
+
+  private inheritSelectedFolder(): void {
+    if (this.scope !== "project") return;
+    const entry = this.visibleEntries()[this.selectedIndex];
+    if (entry?.kind !== "folder") return;
+    this.stageFolder(entry.folder, "inherit");
+  }
+
+  private toggleSelected(): void {
+    const entry = this.visibleEntries()[this.selectedIndex];
+    if (!entry) return;
+    if (entry.kind === "folder") this.toggleFolder(entry.folder);
+    else this.toggleSkill(entry.row);
   }
 
   handleInput(data: string): void {
@@ -101,6 +296,11 @@ class SkillManagerPanel {
     }
     if (matchesKey(data, "ctrl+s")) {
       this.done({ save: true, changes: [...this.staged.values()] });
+      return;
+    }
+    if (matchesKey(data, "ctrl+r")) {
+      this.inheritSelectedFolder();
+      this.tui.requestRender();
       return;
     }
     if (this.keybindings.matches(data, "tui.input.tab") || matchesKey(data, "ctrl+g")) {
@@ -177,13 +377,25 @@ class SkillManagerPanel {
     return this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`);
   }
 
-  private stateIcon(row: SkillCapability): string {
+  private skillStateIcon(row: SkillCapability): string {
     if (row.readOnly) return this.theme.fg("dim", "[·]");
     const state = this.stateFor(row);
-    if (this.scope === "project" && state === "inherit") {
-      const inherited = this.inheritedFor(row) ? "on" : "off";
+    if (state === "inherit") {
+      const inherited = this.baseEffectiveFor(row) ? "on" : "off";
       return this.theme.fg("dim", `[= ${inherited}]`);
     }
+    return this.effectiveFor(row)
+      ? this.theme.fg("success", "[x]")
+      : this.theme.fg("dim", "[ ]");
+  }
+
+  private folderStateIcon(folder: SkillFolderCapability): string {
+    const state = this.folderEffectiveState(folder);
+    if (this.folderIsInherited(folder)) {
+      const inherited = state === "mixed" ? "~" : state === "enabled" ? "on" : "off";
+      return this.theme.fg("dim", `[= ${inherited}]`);
+    }
+    if (state === "mixed") return this.theme.fg("warning", "[~]");
     return state === "enabled"
       ? this.theme.fg("success", "[x]")
       : this.theme.fg("dim", "[ ]");
@@ -198,7 +410,7 @@ class SkillManagerPanel {
   render(width: number): string[] {
     const innerWidth = Math.max(1, width - 2);
     const lines: string[] = [];
-    const rows = this.visibleRows();
+    const entries = this.visibleEntries();
     this.clampSelection();
 
     lines.push(this.theme.fg("border", `╭${"─".repeat(innerWidth)}╮`));
@@ -222,38 +434,63 @@ class SkillManagerPanel {
     ));
     lines.push(this.divider(innerWidth));
 
-    if (rows.length === 0) {
+    if (entries.length === 0) {
       lines.push(this.frame(this.theme.fg("dim", "No matching skills"), innerWidth));
     } else {
       const start = Math.max(0, Math.min(
         this.selectedIndex - Math.floor(this.maxVisible / 2),
-        Math.max(0, rows.length - this.maxVisible),
+        Math.max(0, entries.length - this.maxVisible),
       ));
-      const end = Math.min(rows.length, start + this.maxVisible);
+      const end = Math.min(entries.length, start + this.maxVisible);
       for (let index = start; index < end; index++) {
-        const row = rows[index];
+        const entry = entries[index];
         const selected = index === this.selectedIndex;
         const cursor = selected ? this.theme.fg("accent", "›") : " ";
+        if (entry.kind === "folder") {
+          const folder = entry.folder;
+          const children = this.folderChildren(folder);
+          const enabled = children.filter((row) => this.effectiveFor(row)).length;
+          const name = selected ? this.theme.bold(`${folder.name}/`) : `${folder.name}/`;
+          const dirty = this.staged.has(this.stageKey("folder", folder.key))
+            ? this.theme.fg("warning", " *")
+            : "";
+          lines.push(this.frame(
+            `${cursor} ${this.folderStateIcon(folder)} ▾ ${name}${dirty}  ${this.theme.fg("muted", `${enabled}/${children.length} · ${folder.sourceLabel}`)}`,
+            innerWidth,
+          ));
+          continue;
+        }
+
+        const row = entry.row;
         const name = selected ? this.theme.bold(row.name) : row.name;
-        const dirty = this.staged.has(this.stageKey(row)) ? this.theme.fg("warning", " *") : "";
+        const dirty = this.staged.has(this.stageKey("skill", row.key))
+          ? this.theme.fg("warning", " *")
+          : "";
+        const indent = entry.nested ? "  " : "";
         lines.push(this.frame(
-          `${cursor} ${this.stateIcon(row)} ${name}${dirty}  ${this.theme.fg("muted", row.sourceLabel)}`,
+          `${indent}${cursor} ${this.skillStateIcon(row)} ${name}${dirty}  ${this.theme.fg("muted", row.sourceLabel)}`,
           innerWidth,
         ));
       }
-      if (rows.length > this.maxVisible) {
-        lines.push(this.frame(this.theme.fg("dim", `${this.selectedIndex + 1}/${rows.length}`), innerWidth));
+      if (entries.length > this.maxVisible) {
+        lines.push(this.frame(this.theme.fg("dim", `${this.selectedIndex + 1}/${entries.length}`), innerWidth));
       }
     }
 
     lines.push(this.divider(innerWidth));
-    const selected = rows[this.selectedIndex];
-    const detail = selected?.description
-      || (selected?.readOnly ? "Read-only injected skill" : "Space or Enter changes its state");
+    const selected = entries[this.selectedIndex];
+    let detail = "Space or Enter changes its state";
+    if (selected?.kind === "folder") {
+      detail = `${selected.folder.pattern}/** · persistent rule for current and future Skills`;
+    } else if (selected?.kind === "skill") {
+      detail = selected.row.description
+        || (selected.row.readOnly ? "Read-only injected skill" : detail);
+    }
     lines.push(this.frame(this.theme.fg("muted", detail), innerWidth));
     const scopeKeyHint = this.projectAvailable ? " · Tab/Ctrl+G scope" : "";
+    const inheritHint = this.scope === "project" && selected?.kind === "folder" ? " · Ctrl+R inherit" : "";
     lines.push(this.frame(`${this.summary()} · ${this.staged.size} unsaved${scopeKeyHint}`, innerWidth));
-    lines.push(this.frame("↑↓ move · Space toggle · Ctrl+S save · Esc close", innerWidth));
+    lines.push(this.frame(`↑↓ move · Space toggle${inheritHint} · Ctrl+S save · Esc close`, innerWidth));
     lines.push(this.theme.fg("border", `╰${"─".repeat(innerWidth)}╯`));
     return lines;
   }
@@ -263,11 +500,12 @@ class SkillManagerPanel {
 
 export function createSkillManagerPanel(
   rows: SkillCapability[],
+  folders: SkillFolderCapability[],
   projectAvailable: boolean,
   tui: PanelTui,
   theme: Theme,
   keybindings: KeybindingsManager,
   done: (result: CapabilityPanelResult) => void,
 ): SkillManagerPanel {
-  return new SkillManagerPanel(rows, projectAvailable, tui, theme, keybindings, done);
+  return new SkillManagerPanel(rows, folders, projectAvailable, tui, theme, keybindings, done);
 }

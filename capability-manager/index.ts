@@ -4,17 +4,17 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createSkillManagerPanel } from "./panel.ts";
-import { applySkillCapabilityChanges, discoverSkillCapabilities } from "./skills.ts";
-import type {
-  CapabilityPanelResult,
-  SkillCapability,
-} from "./types.ts";
+import {
+  applySkillCapabilityChanges,
+  discoverSkillCapabilities,
+  type SkillCatalog,
+} from "./skills.ts";
+import type { CapabilityPanelResult } from "./types.ts";
 
-async function loadSkills(ctx: ExtensionCommandContext): Promise<SkillCapability[]> {
+async function loadSkills(ctx: ExtensionCommandContext): Promise<SkillCatalog> {
   const projectAvailable = ctx.isProjectTrusted();
   const loadedSkills = ctx.getSystemPromptOptions().skills ?? [];
-  const catalog = await discoverSkillCapabilities(ctx.cwd, projectAvailable, loadedSkills);
-  return catalog.skills;
+  return discoverSkillCapabilities(ctx.cwd, projectAvailable, loadedSkills);
 }
 
 async function updateStatus(ctx: ExtensionContext): Promise<void> {
@@ -43,9 +43,9 @@ export default function capabilityManager(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) return;
 
-      let skills: SkillCapability[];
+      let catalog: SkillCatalog;
       try {
-        skills = await loadSkills(ctx);
+        catalog = await loadSkills(ctx);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         return;
@@ -53,7 +53,8 @@ export default function capabilityManager(pi: ExtensionAPI) {
 
       const result = await ctx.ui.custom<CapabilityPanelResult>(
         (tui, theme, keybindings, done) => createSkillManagerPanel(
-          skills,
+          catalog.skills,
+          catalog.folders,
           ctx.isProjectTrusted(),
           tui,
           theme,

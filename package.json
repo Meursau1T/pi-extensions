@@ -1,7 +1,7 @@
 {
   "name": "meursau1t-pi-extensions",
-  "version": "0.2.0",
-  "description": "Skill capability manager for Pi",
+  "version": "0.3.0",
+  "description": "Skill and Skill folder manager for Pi",
   "private": true,
   "type": "module",
   "license": "MIT",

@@ -20,7 +20,9 @@ pi install git:git@github.com:Meursau1T/pi-extensions.git
 
 执行 `/caps` 打开 Skill Manager。Tab 或 Ctrl+G 切换全局与项目作用域，输入文字搜索，使用方向键移动，空格或 Enter 切换状态，Ctrl+S 保存，Esc 放弃。
 
-项目状态支持继承、显式启用和显式禁用。状态通过 Pi 原生 `skills` 与 package filters 保存。插件不会移动或改写 `SKILL.md`。当前进程临时注入的 Skill 只读展示。
+`skills/` 下同一个第一层目录中的 Skill 会显示为一个文件夹。文件夹开关会递归控制其中现有及以后新增的 Skill，`[~]` 表示目录内状态不一致。切换整个文件夹会清除旧的子项覆盖，随后仍可单独切换某个 Skill 作为例外。软链接按可见路径分组，不会丢失原来的目录分类。
+
+项目状态支持继承、显式启用和显式禁用。项目文件夹选中后可按 Ctrl+R 清除目录规则和子项例外，恢复继承。状态通过 Pi 原生 `skills` 与 package filters 保存。插件不会移动或改写 `SKILL.md`。当前进程临时注入的 Skill 只读展示，也不会混入可写文件夹。
 
 ## MCP
 
@@ -34,4 +36,4 @@ pi install npm:pi-mcp-adapter
 
 ## 目录
 
-`capability-manager/` 包含 Skill 管理界面、资源发现和全局／项目配置写入逻辑。
+`capability-manager/` 包含 Skill 与文件夹管理界面、资源发现和全局／项目配置写入逻辑。

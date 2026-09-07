@@ -11,10 +11,16 @@ import {
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import type { CapabilityChange, CapabilityState, SkillCapability } from "./types.ts";
+import type {
+  CapabilityChange,
+  CapabilityState,
+  SkillCapability,
+  SkillFolderCapability,
+} from "./types.ts";
 
 export interface SkillCatalog {
   skills: SkillCapability[];
+  folders: SkillFolderCapability[];
   globalCount: number;
   projectCount: number;
 }
@@ -76,18 +82,9 @@ function directiveTarget(entry: string): string {
     : entry;
 }
 
-function getOverrideState(
-  entries: string[],
-  patterns: Set<string>,
-  emptyArrayIsDisabled: boolean,
-): CapabilityState {
-  if (entries.length === 0 && emptyArrayIsDisabled) return "disabled";
-  let state: CapabilityState = "inherit";
-  for (const entry of entries) {
-    if (!patterns.has(directiveTarget(entry))) continue;
-    state = entry.startsWith("!") || entry.startsWith("-") ? "disabled" : "enabled";
-  }
-  return state;
+function normalizePatternPath(value: string): string {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
+  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
 }
 
 function topLevelBaseDir(scope: "global" | "project", cwd: string, agentDir: string): string {
@@ -122,8 +119,40 @@ function topLevelPatterns(
   return patterns;
 }
 
+function topLevelOverrideState(
+  entries: string[],
+  resource: ResolvedResource,
+  cwd: string,
+  agentDir: string,
+): CapabilityState {
+  const candidates = new Set(
+    [...topLevelPatterns(resource, "project", cwd, agentDir)].map(normalizePatternPath),
+  );
+  let state: CapabilityState = "inherit";
+  for (const entry of entries) {
+    if (!candidates.has(normalizePatternPath(directiveTarget(entry)))) continue;
+    state = entry.startsWith("!") || entry.startsWith("-") ? "disabled" : "enabled";
+  }
+  return state;
+}
+
 function packageResourcePattern(resource: ResolvedResource): string {
   return relative(resource.metadata.baseDir ?? dirname(resource.path), resource.path);
+}
+
+function packageOverrideState(
+  entries: string[],
+  resource: ResolvedResource,
+  emptyArrayIsDisabled: boolean,
+): CapabilityState {
+  if (entries.length === 0 && emptyArrayIsDisabled) return "disabled";
+  const candidate = packageResourcePattern(resource);
+  let state: CapabilityState = "inherit";
+  for (const entry of entries) {
+    if (normalizePatternPath(directiveTarget(entry)) !== normalizePatternPath(candidate)) continue;
+    state = entry.startsWith("!") || entry.startsWith("-") ? "disabled" : "enabled";
+  }
+  return state;
 }
 
 function isLocalSource(source: string): boolean {
@@ -185,20 +214,96 @@ function projectOverrideState(
 ): CapabilityState {
   const projectSettings = settingsManager.getProjectSettings();
   if (resource.metadata.origin === "top-level") {
-    return getOverrideState(
-      projectSettings.skills ?? [],
-      topLevelPatterns(resource, "project", cwd, agentDir),
-      false,
-    );
+    return topLevelOverrideState(projectSettings.skills ?? [], resource, cwd, agentDir);
   }
 
   const pkg = findPackage(projectSettings.packages ?? [], resource, "project", cwd, agentDir);
   if (!pkg || typeof pkg === "string" || pkg.skills === undefined) return "inherit";
-  return getOverrideState(
-    pkg.skills,
-    new Set([packageResourcePattern(resource)]),
-    pkg.autoload !== false,
-  );
+  return packageOverrideState(pkg.skills, resource, pkg.autoload !== false);
+}
+
+function firstLevelFolder(resource: ResolvedResource): Omit<
+  SkillFolderCapability,
+  "childKeys" | "visibleIn" | "globalState" | "projectState" | "effectiveState"
+> | undefined {
+  const baseDir = resource.metadata.baseDir;
+  if (!baseDir) return undefined;
+  const relativePath = normalizePatternPath(relative(baseDir, skillFilePath(resource.path)));
+  const parts = relativePath.split("/").filter(Boolean);
+  const skillsIndex = parts.indexOf("skills");
+  if (skillsIndex < 0 || parts.length < skillsIndex + 4) return undefined;
+
+  const name = parts[skillsIndex + 1];
+  if (!name || name === "." || name === "..") return undefined;
+  const pattern = parts.slice(0, skillsIndex + 2).join("/");
+  const path = resolve(baseDir, ...parts.slice(0, skillsIndex + 2));
+  return {
+    key: `folder:${resource.metadata.origin}:${resource.metadata.source}:${canonicalize(path)}`,
+    name,
+    sourceLabel: sourceLabel(resource),
+    path,
+    pattern,
+    resource,
+  };
+}
+
+function aggregateEnabled(values: boolean[]): "enabled" | "disabled" | "mixed" {
+  if (values.length === 0) return "mixed";
+  if (values.every(Boolean)) return "enabled";
+  if (values.every((value) => !value)) return "disabled";
+  return "mixed";
+}
+
+function topLevelFolderCandidates(
+  folder: SkillFolderCapability,
+  scope: "global" | "project",
+  cwd: string,
+  agentDir: string,
+): Set<string> {
+  const candidates = new Set([
+    normalizePatternPath(folder.pattern),
+    normalizePatternPath(folder.path),
+    normalizePatternPath(relative(topLevelBaseDir(scope, cwd, agentDir), folder.path)),
+  ]);
+  if (folder.resource.metadata.baseDir) {
+    candidates.add(normalizePatternPath(relative(folder.resource.metadata.baseDir, folder.path)));
+  }
+  return candidates;
+}
+
+function folderPolicyEntryMatches(entry: string, candidates: Set<string>): boolean {
+  const target = normalizePatternPath(directiveTarget(entry));
+  const base = target.endsWith("/**") ? target.slice(0, -3).replace(/\/+$/, "") : target;
+  return candidates.has(base);
+}
+
+function projectFolderOverrideState(
+  folder: SkillFolderCapability,
+  settingsManager: SettingsManager,
+  cwd: string,
+  agentDir: string,
+): CapabilityState {
+  const projectSettings = settingsManager.getProjectSettings();
+  if (folder.resource.metadata.origin === "top-level") {
+    const candidates = topLevelFolderCandidates(folder, "project", cwd, agentDir);
+    let state: CapabilityState = "inherit";
+    for (const entry of projectSettings.skills ?? []) {
+      if (!folderPolicyEntryMatches(entry, candidates)) continue;
+      state = entry.startsWith("!") || entry.startsWith("-") ? "disabled" : "enabled";
+    }
+    return state;
+  }
+
+  const pkg = findPackage(projectSettings.packages ?? [], folder.resource, "project", cwd, agentDir);
+  if (!pkg || typeof pkg === "string" || pkg.skills === undefined) return "inherit";
+  if (pkg.skills.length === 0 && pkg.autoload !== false) return "disabled";
+  const candidates = new Set([normalizePatternPath(folder.pattern)]);
+  let state: CapabilityState = "inherit";
+  for (const entry of pkg.skills) {
+    if (!folderPolicyEntryMatches(entry, candidates)) continue;
+    state = entry.startsWith("!") || entry.startsWith("-") ? "disabled" : "enabled";
+  }
+  return state;
 }
 
 export async function discoverSkillCapabilities(
@@ -311,8 +416,50 @@ export async function discoverSkillCapabilities(
   }
 
   const skills = [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const foldersByKey = new Map<string, SkillFolderCapability>();
+  for (const skill of skills) {
+    if (skill.readOnly || !skill.resource) continue;
+    const descriptor = firstLevelFolder(skill.resource);
+    if (!descriptor) continue;
+    skill.folderKey = descriptor.key;
+    const existing = foldersByKey.get(descriptor.key);
+    if (existing) {
+      existing.childKeys.push(skill.key);
+      for (const scope of skill.visibleIn) {
+        if (!existing.visibleIn.includes(scope)) existing.visibleIn.push(scope);
+      }
+    } else {
+      foldersByKey.set(descriptor.key, {
+        ...descriptor,
+        childKeys: [skill.key],
+        visibleIn: [...skill.visibleIn],
+        globalState: "mixed",
+        projectState: "inherit",
+        effectiveState: "mixed",
+      });
+    }
+  }
+
+  const skillByKey = new Map(skills.map((skill) => [skill.key, skill]));
+  for (const folder of foldersByKey.values()) {
+    const children = folder.childKeys
+      .map((key) => skillByKey.get(key))
+      .filter((skill): skill is SkillCapability => skill !== undefined);
+    const globalChildren = children.filter((skill) => skill.visibleIn.includes("global"));
+    const projectChildren = children.filter((skill) => skill.visibleIn.includes("project"));
+    folder.globalState = aggregateEnabled(globalChildren.map((skill) => skill.globalState === "enabled"));
+    folder.effectiveState = aggregateEnabled(projectChildren.map((skill) => skill.effectiveEnabled));
+    folder.projectState = projectTrusted
+      ? projectFolderOverrideState(folder, projectSettings, cwd, agentDir)
+      : "inherit";
+  }
+
+  const folders = [...foldersByKey.values()].sort((a, b) =>
+    a.name.localeCompare(b.name) || a.sourceLabel.localeCompare(b.sourceLabel),
+  );
   return {
     skills,
+    folders,
     globalCount: skills.filter((skill) => skill.visibleIn.includes("global")).length,
     projectCount: skills.filter((skill) => skill.visibleIn.includes("project")).length,
   };
@@ -320,6 +467,35 @@ export async function discoverSkillCapabilities(
 
 function removeMatchingEntries(entries: string[], patterns: Set<string>): string[] {
   return entries.filter((entry) => !patterns.has(directiveTarget(entry)));
+}
+
+function folderEntryMatches(
+  entry: string,
+  folder: SkillFolderCapability,
+  scope: "global" | "project",
+  cwd: string,
+  agentDir: string,
+): boolean {
+  const target = normalizePatternPath(directiveTarget(entry));
+  const entryBase = target.endsWith("/**") ? target.slice(0, -3).replace(/\/+$/, "") : target;
+  const candidates = topLevelFolderCandidates(folder, scope, cwd, agentDir);
+  return [...candidates].some((candidate) =>
+    entryBase === candidate || entryBase.startsWith(`${candidate}/`),
+  );
+}
+
+function packageFolderEntryMatches(entry: string, folder: SkillFolderCapability): boolean {
+  const target = normalizePatternPath(directiveTarget(entry));
+  const entryBase = target.endsWith("/**") ? target.slice(0, -3).replace(/\/+$/, "") : target;
+  const pattern = normalizePatternPath(folder.pattern);
+  return entryBase === pattern || entryBase.startsWith(`${pattern}/`);
+}
+
+function packageUsesInclusionFilter(skills: string[] | undefined): boolean {
+  return skills !== undefined && (
+    skills.length === 0
+    || skills.some((entry) => !entry.startsWith("!") && !entry.startsWith("+") && !entry.startsWith("-"))
+  );
 }
 
 function applyTopLevelGlobal(
@@ -332,7 +508,7 @@ function applyTopLevelGlobal(
   const pattern = resourcePatternForScope(resource, "global", cwd, agentDir);
   const current = settingsManager.getGlobalSettings().skills ?? [];
   const updated = removeMatchingEntries(current, topLevelPatterns(resource, "global", cwd, agentDir));
-  updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
+  if (state !== "inherit") updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
   settingsManager.setSkillPaths(updated);
 }
 
@@ -353,6 +529,32 @@ function applyTopLevelProject(
   } else if (state !== "inherit") {
     if (inherited && !updated.includes(pattern)) updated.push(pattern);
     updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
+  }
+  settingsManager.setProjectSkillPaths(updated);
+}
+
+function applyTopLevelFolder(
+  settingsManager: SettingsManager,
+  folder: SkillFolderCapability,
+  state: CapabilityState,
+  scope: "global" | "project",
+  cwd: string,
+  agentDir: string,
+): void {
+  const current = scope === "global"
+    ? settingsManager.getGlobalSettings().skills ?? []
+    : settingsManager.getProjectSettings().skills ?? [];
+  const updated = current.filter((entry) => !folderEntryMatches(entry, folder, scope, cwd, agentDir));
+
+  if (scope === "global") {
+    if (state === "disabled") updated.push(`!${normalizePatternPath(folder.path)}/**`);
+    settingsManager.setSkillPaths(updated);
+    return;
+  }
+
+  if (state !== "inherit") {
+    updated.push(folder.path);
+    if (state === "disabled") updated.push(`!${normalizePatternPath(folder.path)}/**`);
   }
   settingsManager.setProjectSkillPaths(updated);
 }
@@ -379,9 +581,9 @@ function applyPackageGlobal(
   const pkg = typeof currentPackage === "string" ? { source: currentPackage } : { ...currentPackage };
   const pattern = packageResourcePattern(resource);
   const updated = (pkg.skills ?? []).filter((entry) => directiveTarget(entry) !== pattern);
-  updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
-  pkg.skills = updated;
-  packages[index] = pkg;
+  if (state !== "inherit") updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
+  pkg.skills = updated.length > 0 ? updated : undefined;
+  cleanupPackageObject(packages, index, pkg);
   settingsManager.setPackages(packages);
 }
 
@@ -398,6 +600,23 @@ function createProjectPackageOverride(
     source: relative(topLevelBaseDir("project", cwd, agentDir), absolute) || ".",
     autoload: false,
   };
+}
+
+function cleanupPackageObject(
+  packages: PackageSource[],
+  index: number,
+  pkg: Exclude<PackageSource, string>,
+): void {
+  const hasFilters = pkg.extensions !== undefined
+    || pkg.skills !== undefined
+    || pkg.prompts !== undefined
+    || pkg.themes !== undefined;
+  if (!hasFilters) {
+    if (pkg.autoload === false) packages.splice(index, 1);
+    else packages[index] = pkg.source;
+  } else {
+    packages[index] = pkg;
+  }
 }
 
 function applyPackageProject(
@@ -430,17 +649,79 @@ function applyPackageProject(
   const updated = (pkg.skills ?? []).filter((entry) => directiveTarget(entry) !== pattern);
   if (state !== "inherit") updated.push(`${state === "enabled" ? "+" : "-"}${pattern}`);
   pkg.skills = updated.length > 0 ? updated : undefined;
+  cleanupPackageObject(packages, index, pkg);
+  settingsManager.setProjectPackages(packages);
+}
 
-  const hasFilters = pkg.extensions !== undefined
-    || pkg.skills !== undefined
-    || pkg.prompts !== undefined
-    || pkg.themes !== undefined;
-  if (!hasFilters) {
-    if (pkg.autoload === false) packages.splice(index, 1);
-    else packages[index] = pkg.source;
-  } else {
-    packages[index] = pkg;
+function applyPackageFolderGlobal(
+  settingsManager: SettingsManager,
+  folder: SkillFolderCapability,
+  state: CapabilityState,
+  cwd: string,
+  agentDir: string,
+): void {
+  const resource = folder.resource;
+  const packages = [...(settingsManager.getGlobalSettings().packages ?? [])];
+  const index = packages.findIndex((pkg) => packageSourcesMatch(
+    resource.metadata.source,
+    resource.metadata.scope === "project" ? "project" : "global",
+    typeof pkg === "string" ? pkg : pkg.source,
+    "global",
+    cwd,
+    agentDir,
+  ));
+  if (index < 0) return;
+
+  const currentPackage = packages[index];
+  const pkg = typeof currentPackage === "string" ? { source: currentPackage } : { ...currentPackage };
+  const inclusionFilter = packageUsesInclusionFilter(pkg.skills);
+  const updated = (pkg.skills ?? []).filter((entry) => !packageFolderEntryMatches(entry, folder));
+  if (state === "disabled") {
+    updated.push(`!${normalizePatternPath(folder.pattern)}/**`);
+  } else if (pkg.autoload === false || inclusionFilter) {
+    updated.push(`${normalizePatternPath(folder.pattern)}/**`);
   }
+  pkg.skills = updated.length > 0 ? updated : undefined;
+  cleanupPackageObject(packages, index, pkg);
+  settingsManager.setPackages(packages);
+}
+
+function applyPackageFolderProject(
+  settingsManager: SettingsManager,
+  folder: SkillFolderCapability,
+  state: CapabilityState,
+  cwd: string,
+  agentDir: string,
+): void {
+  const resource = folder.resource;
+  const packages = [...(settingsManager.getProjectSettings().packages ?? [])];
+  let index = packages.findIndex((pkg) => packageSourcesMatch(
+    resource.metadata.source,
+    resource.metadata.scope === "project" ? "project" : "global",
+    typeof pkg === "string" ? pkg : pkg.source,
+    "project",
+    cwd,
+    agentDir,
+  ));
+
+  if (index < 0) {
+    if (state === "inherit") return;
+    packages.push(createProjectPackageOverride(resource, cwd, agentDir));
+    index = packages.length - 1;
+  }
+
+  const currentPackage = packages[index];
+  if (currentPackage === undefined) return;
+  const pkg = typeof currentPackage === "string" ? { source: currentPackage } : { ...currentPackage };
+  const inclusionFilter = packageUsesInclusionFilter(pkg.skills);
+  const updated = (pkg.skills ?? []).filter((entry) => !packageFolderEntryMatches(entry, folder));
+  if (state === "disabled") {
+    updated.push(`!${normalizePatternPath(folder.pattern)}/**`);
+  } else if (state === "enabled" && (pkg.autoload === false || inclusionFilter)) {
+    updated.push(`${normalizePatternPath(folder.pattern)}/**`);
+  }
+  pkg.skills = updated.length > 0 ? updated : undefined;
+  cleanupPackageObject(packages, index, pkg);
   settingsManager.setProjectPackages(packages);
 }
 
@@ -449,18 +730,27 @@ export async function applySkillCapabilityChanges(
   projectTrusted: boolean,
   changes: CapabilityChange[],
 ): Promise<void> {
-  const relevant = changes.filter(
-    (change) => !change.row.readOnly && change.state !== "inherit",
-  );
-  const projectInheritChanges = changes.filter(
-    (change) => !change.row.readOnly && change.scope === "project" && change.state === "inherit",
-  );
-  if (relevant.length === 0 && projectInheritChanges.length === 0) return;
-
+  if (changes.length === 0) return;
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+  const folderChanges = changes.filter((change) => change.kind === "folder");
+  const skillChanges = changes.filter((change) => change.kind === "skill");
 
-  for (const change of [...relevant, ...projectInheritChanges]) {
+  for (const change of folderChanges) {
+    if (change.scope === "project" && !projectTrusted) throw new Error("Project is not trusted");
+    if (change.folder.resource.metadata.origin === "package") {
+      if (change.scope === "global") {
+        applyPackageFolderGlobal(settingsManager, change.folder, change.state, cwd, agentDir);
+      } else {
+        applyPackageFolderProject(settingsManager, change.folder, change.state, cwd, agentDir);
+      }
+    } else {
+      applyTopLevelFolder(settingsManager, change.folder, change.state, change.scope, cwd, agentDir);
+    }
+  }
+
+  for (const change of skillChanges) {
+    if (change.row.readOnly) continue;
     const skill = change.row;
     const resource = skill.resource;
     if (!resource) continue;
