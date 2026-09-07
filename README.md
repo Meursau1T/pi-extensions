@@ -1,10 +1,8 @@
 # pi-extensions
 
-这个仓库提供 Pi 的统一能力管理器。`capability-manager/` 负责管理界面，`pi-mcp-adapter/` 是基于 `pi-mcp-adapter 2.10.0` 的本地分支，提供 MCP Server 的完整禁用能力和事件桥接。
+这个仓库提供独立的 Pi Skill 管理器。插件源码位于 `capability-manager/`，不读取、不修改、也不依赖任何 MCP adapter。
 
 ## 安装
-
-不要和官方 `npm:pi-mcp-adapter` 同时启用。安装整个仓库即可同时加载管理器和配套 MCP adapter。
 
 ```bash
 pi install git:github.com/Meursau1T/pi-extensions
@@ -20,14 +18,20 @@ pi install git:git@github.com:Meursau1T/pi-extensions.git
 
 ## 使用
 
-执行 `/caps` 打开面板。Tab 切换 Skills 和 MCP，Ctrl+G 切换全局与项目作用域，空格或 Enter 切换状态，Ctrl+S 保存，Esc 放弃。
+执行 `/caps` 打开 Skill Manager。Tab 或 Ctrl+G 切换全局与项目作用域，输入文字搜索，使用方向键移动，空格或 Enter 切换状态，Ctrl+S 保存，Esc 放弃。
 
-项目状态支持继承、显式启用和显式禁用。Skill 状态写入 Pi 原生资源过滤配置。MCP 状态写入 Pi 专属 `settings.serverStates`，不会改动共享 MCP 定义。禁用 MCP Server 后，它不会启动、参与工具搜索、接受代理调用或注册 direct tool；原配置、缓存和 OAuth 信息会保留。
+项目状态支持继承、显式启用和显式禁用。状态通过 Pi 原生 `skills` 与 package filters 保存。插件不会移动或改写 `SKILL.md`。当前进程临时注入的 Skill 只读展示。
 
-临时注入的 Skill 与失去配置来源的 MCP 缓存只读展示。
+## MCP
+
+MCP 不属于这个插件的职责。需要 MCP 时请单独安装和使用官方 `pi-mcp-adapter`。
+
+```bash
+pi install npm:pi-mcp-adapter
+```
+
+`pi-mcp-adapter` 2.32.1 及以上可通过 `/mcp` 面板或 `/mcp enable <server>`、`/mcp disable <server>` 独立控制 Server。
 
 ## 目录
 
-`capability-manager/` 是统一管理插件源码。
-
-`pi-mcp-adapter/` 保留上游 MIT License，并包含能力管理所需的服务器级禁用与桥接修改。
+`capability-manager/` 包含 Skill 管理界面、资源发现和全局／项目配置写入逻辑。

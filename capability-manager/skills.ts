@@ -228,7 +228,6 @@ export async function discoverSkillCapabilities(
     const info = readSkillInfo(resource.path);
     const key = canonicalize(info.path);
     byKey.set(key, {
-      kind: "skill",
       key: `skill:${key}`,
       name: info.name,
       description: info.description,
@@ -261,7 +260,6 @@ export async function discoverSkillCapabilities(
     }
 
     byKey.set(canonicalPath, {
-      kind: "skill",
       key: `skill:${canonicalPath}`,
       name: info.name,
       description: info.description,
@@ -298,7 +296,6 @@ export async function discoverSkillCapabilities(
       ? ["global", "project"] as const
       : ["project"] as const;
     byKey.set(canonicalPath, {
-      kind: "skill",
       key: `skill:${canonicalPath}`,
       name: skill.name,
       description: skill.description.replace(/\s+/g, " ").trim(),
@@ -453,10 +450,10 @@ export async function applySkillCapabilityChanges(
   changes: CapabilityChange[],
 ): Promise<void> {
   const relevant = changes.filter(
-    (change) => change.row.kind === "skill" && !change.row.readOnly && change.state !== "inherit",
+    (change) => !change.row.readOnly && change.state !== "inherit",
   );
   const projectInheritChanges = changes.filter(
-    (change) => change.row.kind === "skill" && !change.row.readOnly && change.scope === "project" && change.state === "inherit",
+    (change) => !change.row.readOnly && change.scope === "project" && change.state === "inherit",
   );
   if (relevant.length === 0 && projectInheritChanges.length === 0) return;
 
@@ -464,7 +461,7 @@ export async function applySkillCapabilityChanges(
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
 
   for (const change of [...relevant, ...projectInheritChanges]) {
-    const skill = change.row as SkillCapability;
+    const skill = change.row;
     const resource = skill.resource;
     if (!resource) continue;
     const inherited = skill.visibleIn.includes("global");
